@@ -16,7 +16,21 @@ import CryptoKit
 //                                        anthropic-ratelimit-unified-* headers.
 // Route 2 is skipped entirely in "Never spend tokens" mode.
 
-let TOKEN_DIR = NSString(string: "~/.config/claude-multi-account").expandingTildeInPath
+/// Config resolution order: environment variable, then a UserDefaults key, then
+/// the built-in default. Lets this run unmodified on someone else's machine.
+func cfg(_ env: String, _ key: String, _ fallback: String) -> String {
+    if let v = ProcessInfo.processInfo.environment[env], !v.isEmpty { return v }
+    if let v = UserDefaults.standard.string(forKey: key), !v.isEmpty { return v }
+    return fallback
+}
+func cfgNum(_ env: String, _ key: String, _ fallback: Double) -> Double {
+    if let v = ProcessInfo.processInfo.environment[env], let d = Double(v) { return d }
+    let v = UserDefaults.standard.double(forKey: key)
+    return v > 0 ? v : fallback
+}
+
+let TOKEN_DIR = NSString(string: cfg("CLAUDE_LIMITS_TOKEN_DIR", "tokenDir",
+                                     "~/.config/claude-multi-account")).expandingTildeInPath
 let K_INTERVAL = "refreshMinutes"
 let K_HIDDEN = "hiddenProfiles"
 let K_SHOW_UNAVAIL = "showUnavailable"
@@ -24,11 +38,23 @@ let K_NEVER_SPEND = "neverSpendTokens"
 let K_USE_KEYCHAIN = "includeKeychain"
 
 // Measured 2026-10-17: 35,537 input tokens moved 5h utilization by exactly 0.01.
-let MEASURED_5H_BUDGET = 3_553_699.0
+/// Token budget of one 5-hour window, used ONLY to express the meter's own cost
+/// as a percentage. Measured on a single Team-plan account: 35,537 input tokens
+/// moved 5h utilization by exactly 0.01. YOUR PLAN WILL DIFFER — override with
+/// CLAUDE_LIMITS_5H_BUDGET or the `fiveHourBudget` default. Nothing else depends
+/// on this; the meters themselves come from the API and are always accurate.
+let MEASURED_5H_BUDGET = cfgNum("CLAUDE_LIMITS_5H_BUDGET", "fiveHourBudget", 3_553_699.0)
+let BUDGET_IS_DEFAULT = ProcessInfo.processInfo.environment["CLAUDE_LIMITS_5H_BUDGET"] == nil
+    && UserDefaults.standard.double(forKey: "fiveHourBudget") <= 0
+
+/// Model used for the fallback probe. Any model the account can reach works; the
+/// response is discarded and only the headers are read.
+let PROBE_MODEL = cfg("CLAUDE_LIMITS_MODEL", "probeModel", "claude-haiku-4-5-20251001")
 /// Written by the local usage proxy, which harvests rate-limit headers from
 /// traffic your sessions were making anyway. Keyed by SHA-256 prefix of the
 /// token. Free and live, but only covers accounts actually in use.
-let PROXY_USAGE = NSString(string: "~/.local/share/claude-usage/usage.json").expandingTildeInPath
+let PROXY_USAGE = NSString(string: cfg("CLAUDE_LIMITS_USAGE_FILE", "usageFile",
+                                       "~/.local/share/claude-usage/usage.json")).expandingTildeInPath
 /// Past this age a proxy observation is considered stale and we fall through to
 /// polling, so idle accounts do not freeze at an old reading.
 let PROXY_MAX_AGE: TimeInterval = 20 * 60
@@ -266,7 +292,7 @@ final class Controller: NSObject, NSMenuDelegate {
         guard let tok = a.token, !tok.isEmpty else {
             u.error = "no token"; done(u); return
         }
-        if let p = proxyUsage(for: tok) { done(p); return }
+        if let p = proxyUsage(for: tok) { done(p); return }   // cheap local read
         freeUsage(tok) { free in
             if var f = free, f.fiveH != nil || f.sevenD != nil {
                 f.free = true; f.checked = Date(); done(f); return
@@ -331,8 +357,9 @@ final class Controller: NSObject, NSMenuDelegate {
         req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
         req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
         req.setValue("application/json", forHTTPHeaderField: "content-type")
-        req.httpBody = #"{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"."}]}"#
-            .data(using: .utf8)
+        let payload: [String: Any] = ["model": PROBE_MODEL, "max_tokens": 1,
+                                      "messages": [["role": "user", "content": "."]]]
+        req.httpBody = try? JSONSerialization.data(withJSONObject: payload)
         URLSession.shared.dataTask(with: req) { data, resp, err in
             if let err = err { u.error = err.localizedDescription; done(u); return }
             guard let http = resp as? HTTPURLResponse else { u.error = "no response"; done(u); return }
@@ -613,7 +640,7 @@ final class Controller: NSObject, NSMenuDelegate {
            per day           \(refreshMinutes == 0 ? "0 while idle" : "\(Int(perDay)) tokens")
            share of capacity \(refreshMinutes == 0 ? "0%" : String(format: "%.4f%%", perDay / dailyBudget * 100))
 
-        HOW THE BUDGET WAS MEASURED
+        HOW THE BUDGET WAS MEASURED\(BUDGET_IS_DEFAULT ? "  (NOT YOURS - SEE BELOW)" : "")
 
         The API reports utilization only as a fraction, never an absolute
         budget. Measured 2026-10-17: 35,537 input tokens moved the 5h
@@ -621,6 +648,13 @@ final class Controller: NSObject, NSMenuDelegate {
         tokens (~17M/day equivalent). Reporting resolution is 0.01, so the
         true figure lies in roughly 2.4M–7.1M; the percentages above could
         be off by ~2x and remain negligible.
+        \(BUDGET_IS_DEFAULT ? """
+        This figure was measured on ONE Team-plan account and is almost
+        certainly not yours. Only the cost percentages above depend on it —
+        the usage meters come from the API and are always accurate. To
+        correct it, set CLAUDE_LIMITS_5H_BUDGET or the 'fiveHourBudget'
+        default to your own measurement.
+        """ : "Using your configured budget figure.")
 
         WHAT THE COLUMNS MEAN
 
