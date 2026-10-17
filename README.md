@@ -46,7 +46,16 @@ it, `SecItemCopyMatching` blocks indefinitely.
 
 ## How usage is read, and what it costs
 
-Two routes, cheapest first:
+Three routes, cheapest first:
+
+**0. Local usage proxy — free *and* live.** `contrib/usage-proxy.py` forwards your
+session traffic to `api.anthropic.com` and harvests the rate-limit headers riding on
+replies you were already receiving. No request is originated, so it costs nothing,
+and it updates the instant a session gets a reply. Rows sourced this way show
+`live`. It only covers accounts you actually *use* — readings older than 20 minutes
+are treated as stale and fall through to polling, so idle accounts never freeze at
+an old value. See `contrib/README.md`, and note the `ECONNREFUSED` guard there: it
+is not optional.
 
 **1. `GET /api/oauth/usage` — free.** Requires the `user:profile` OAuth scope.
 Credentials from `claude auth login` carry it; credentials from
@@ -88,6 +97,7 @@ figures could be off by ~2x and remain negligible.
 | `weekly(7d)` | rolling 7-day window, and time until it resets |
 | orange | ≥75% used, or the API returned `allowed_warning` |
 | red | ≥90% used, `rejected`, or the account errored |
+| `live` | observed from real session traffic via the proxy — free, current |
 | `free` | fetched at no token cost |
 
 The menu bar title shows the worst weekly figure across visible accounts.

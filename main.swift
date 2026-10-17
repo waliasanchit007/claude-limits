@@ -1,6 +1,7 @@
 import Cocoa
 import ServiceManagement
 import Security
+import CryptoKit
 
 // ClaudeLimits - menu bar meter for Claude session (5h) and weekly (7d) limits.
 //
@@ -24,6 +25,13 @@ let K_USE_KEYCHAIN = "includeKeychain"
 
 // Measured 2026-10-17: 35,537 input tokens moved 5h utilization by exactly 0.01.
 let MEASURED_5H_BUDGET = 3_553_699.0
+/// Written by the local usage proxy, which harvests rate-limit headers from
+/// traffic your sessions were making anyway. Keyed by SHA-256 prefix of the
+/// token. Free and live, but only covers accounts actually in use.
+let PROXY_USAGE = NSString(string: "~/.local/share/claude-usage/usage.json").expandingTildeInPath
+/// Past this age a proxy observation is considered stale and we fall through to
+/// polling, so idle accounts do not freeze at an old reading.
+let PROXY_MAX_AGE: TimeInterval = 20 * 60
 let TOKENS_PER_PROBE = 9.0
 
 enum Source {
@@ -61,6 +69,7 @@ struct Usage {
     var state: String?
     var error: String?
     var free: Bool = false       // fetched without spending tokens
+    var live: Bool = false       // observed from real session traffic via the proxy
     var checked: Date?
     var available: Bool { error == nil && (fiveH != nil || sevenD != nil) }
 }
@@ -257,16 +266,46 @@ final class Controller: NSObject, NSMenuDelegate {
         guard let tok = a.token, !tok.isEmpty else {
             u.error = "no token"; done(u); return
         }
+        if let p = proxyUsage(for: tok) { done(p); return }
         freeUsage(tok) { free in
             if var f = free, f.fiveH != nil || f.sevenD != nil {
                 f.free = true; f.checked = Date(); done(f); return
             }
             if self.neverSpend {
-                u.error = "needs user:profile scope (free mode)"
+                u.error = "no free source (run a session, or see About)"
                 done(u); return
             }
             self.paidProbe(tok, into: u, done: done)
         }
+    }
+
+    /// Route 0: read what the local proxy already observed. Zero cost, no network.
+    func proxyUsage(for token: String) -> Usage? {
+        let key = SHA256.hash(data: Data(token.utf8))
+            .map { String(format: "%02x", $0) }.joined().prefix(16)
+        guard let data = FileManager.default.contents(atPath: PROXY_USAGE),
+              let db = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let e = db[String(key)] as? [String: Any],
+              let seen = e["observed_at"] as? Double else { return nil }
+        let age = Date().timeIntervalSince1970 - seen
+        guard age < PROXY_MAX_AGE else { return nil }
+
+        func num(_ k: String) -> Double? {
+            if let d = e[k] as? Double { return d }
+            if let s = e[k] as? String { return Double(s) }
+            return nil
+        }
+        var u = Usage()
+        u.fiveH = num("5h-utilization")
+        u.sevenD = num("7d-utilization")
+        u.fiveHReset = num("5h-reset").map { Date(timeIntervalSince1970: $0) }
+        u.sevenDReset = num("7d-reset").map { Date(timeIntervalSince1970: $0) }
+        u.state = e["status"] as? String
+        u.checked = Date(timeIntervalSince1970: seen)
+        u.free = true
+        u.live = true
+        guard u.fiveH != nil || u.sevenD != nil else { return nil }
+        return u
     }
 
     func freeUsage(_ tok: String, done: @escaping (Usage?) -> Void) {
@@ -357,7 +396,7 @@ final class Controller: NSObject, NSMenuDelegate {
             line = pad(a.name, 11) + "  "
                  + meterBar(u.fiveH) + " " + pct(u.fiveH) + " " + pad(relTime(u.fiveHReset), 6)
                  + "  " + meterBar(u.sevenD) + " " + pct(u.sevenD) + " " + pad(relTime(u.sevenDReset), 6)
-                 + (u.free ? "  free" : "")
+                 + (u.live ? "  live" : (u.free ? "  free" : ""))
             if u.state == "rejected" || (u.sevenD ?? 0) >= 0.9 { attrs[.foregroundColor] = NSColor.systemRed }
             else if u.state == "allowed_warning" || (u.sevenD ?? 0) >= 0.75 { attrs[.foregroundColor] = NSColor.systemOrange }
         } else {
@@ -544,6 +583,14 @@ final class Controller: NSObject, NSMenuDelegate {
 
         The app tries the cheapest route available for each account:
 
+        0. Local usage proxy  —  FREE and LIVE, no tokens, no network.
+           A pass-through proxy on 127.0.0.1 harvests the rate-limit
+           headers from traffic your sessions make anyway, and writes
+           them to ~/.local/share/claude-usage/usage.json. Rows sourced
+           this way are marked 'live'. Readings older than 20 min are
+           ignored so idle accounts do not freeze at a stale value.
+           Only covers accounts you actually USE.
+
         1. GET /api/oauth/usage  —  FREE, no tokens.
            Requires the 'user:profile' OAuth scope. Credentials from
            `claude auth login` carry it; credentials from
@@ -638,7 +685,7 @@ if CommandLine.arguments.contains("--once") {
             print(pad(n, 11) + "  "
                 + meterBar(u.fiveH) + " " + pct(u.fiveH) + " " + pad(relTime(u.fiveHReset), 7)
                 + "  " + meterBar(u.sevenD) + " " + pct(u.sevenD) + " " + pad(relTime(u.sevenDReset), 7)
-                + "  " + (u.free ? "free" : (u.state ?? "")))
+                + "  " + (u.live ? "live" : (u.free ? "free" : (u.state ?? ""))))
         }
     }
     exit(0)
