@@ -122,6 +122,15 @@ final class Controller: NSObject, NSMenuDelegate {
     var timer: Timer?
     var refreshing = false
     var infoWindow: NSWindow?
+    /// Rows are kept as stable references so they can be updated while the menu is
+    /// open. Rebuilding the whole menu mid-display would collapse it.
+    var accountItems: [String: NSMenuItem] = [:]
+    var footerItem: NSMenuItem?
+    var menuIsOpen = false
+    var lastRefresh: Date?
+    /// Set when the user picks "Refresh now": macOS dismisses the menu on any
+    /// click, so re-present it once the data lands instead of dead-ending.
+    var reopenAfterRefresh = false
 
     var refreshMinutes: Int {
         get { let v = UserDefaults.standard.object(forKey: K_INTERVAL) as? Int; return v ?? 30 }
@@ -223,14 +232,22 @@ final class Controller: NSObject, NSMenuDelegate {
         discover()
         let targets = accounts.filter { !hidden.contains($0.name) && !$0.source.isDisabled }
         guard !targets.isEmpty else { rebuildMenu(); return }
-        refreshing = true; rebuildMenu()
+        refreshing = true
+        if menuIsOpen { updateRows() } else { rebuildMenu() }
         let group = DispatchGroup()
         for a in targets {
             group.enter()
             fetch(a) { u in DispatchQueue.main.async { self.results[a.name] = u; group.leave() } }
         }
         group.notify(queue: .main) {
-            self.refreshing = false; self.updateTitle(); self.rebuildMenu()
+            self.refreshing = false
+            self.lastRefresh = Date()
+            self.updateTitle()
+            if self.menuIsOpen { self.updateRows() } else { self.rebuildMenu() }
+            if self.reopenAfterRefresh {
+                self.reopenAfterRefresh = false
+                self.statusItem.button?.performClick(nil)
+            }
         }
     }
 
@@ -308,7 +325,68 @@ final class Controller: NSObject, NSMenuDelegate {
         statusItem.button?.title = "\(g) \(Int((worst * 100).rounded()))%"
     }
 
-    func menuNeedsUpdate(_ menu: NSMenu) { rebuildMenu() }
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        // Structure is rebuilt only before the menu is shown, never during.
+        if !menuIsOpen { rebuildMenu() }
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        menuIsOpen = true
+        // Auto-refresh on open so "Refresh now" is rarely needed. Guarded by
+        // staleness so repeatedly opening the menu cannot run up a token bill.
+        let stale = lastRefresh.map { Date().timeIntervalSince($0) > 60 } ?? true
+        if stale { refreshAll() }
+    }
+
+    func menuDidClose(_ menu: NSMenu) { menuIsOpen = false }
+
+    /// Renders one account row. Used both when building the menu and when
+    /// updating it live, so the two can never drift apart.
+    func applyRow(_ item: NSMenuItem, _ a: Account) {
+        var attrs: [NSAttributedString.Key: Any] =
+            [.font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)]
+        let u = results[a.name]
+        let line: String
+        if a.source.isDisabled {
+            line = pad(a.name, 11) + "  — disabled"
+            attrs[.foregroundColor] = NSColor.tertiaryLabelColor
+        } else if let e = u?.error {
+            line = pad(a.name, 11) + "  ⚠ " + e
+            attrs[.foregroundColor] = NSColor.systemRed
+        } else if let u = u {
+            line = pad(a.name, 11) + "  "
+                 + meterBar(u.fiveH) + " " + pct(u.fiveH) + " " + pad(relTime(u.fiveHReset), 6)
+                 + "  " + meterBar(u.sevenD) + " " + pct(u.sevenD) + " " + pad(relTime(u.sevenDReset), 6)
+                 + (u.free ? "  free" : "")
+            if u.state == "rejected" || (u.sevenD ?? 0) >= 0.9 { attrs[.foregroundColor] = NSColor.systemRed }
+            else if u.state == "allowed_warning" || (u.sevenD ?? 0) >= 0.75 { attrs[.foregroundColor] = NSColor.systemOrange }
+        } else {
+            line = pad(a.name, 11) + "  checking…"
+            attrs[.foregroundColor] = NSColor.secondaryLabelColor
+        }
+        item.attributedTitle = NSAttributedString(string: line, attributes: attrs)
+    }
+
+    func applyFooter(_ item: NSMenuItem) {
+        let mono: [NSAttributedString.Key: Any] =
+            [.font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular),
+             .foregroundColor: NSColor.secondaryLabelColor]
+        let text: String
+        if refreshing { text = "refreshing…" }
+        else if let l = results.values.compactMap({ $0.checked }).max() {
+            let s = max(0, Int(-l.timeIntervalSinceNow))
+            text = s < 60 ? "updated just now" : "updated \(s / 60)m ago"
+        } else { text = "not yet updated" }
+        item.attributedTitle = NSAttributedString(string: text, attributes: mono)
+    }
+
+    /// Safe to call while the menu is open - mutates existing items only.
+    func updateRows() {
+        for a in accounts {
+            if let item = accountItems[a.name] { applyRow(item, a) }
+        }
+        if let f = footerItem { applyFooter(f) }
+    }
 
     func rebuildMenu() {
         guard let menu = statusItem.menu else { return }
@@ -326,6 +404,7 @@ final class Controller: NSObject, NSMenuDelegate {
         row("account      session(5h)         weekly(7d)", monoBold)
         menu.addItem(.separator())
 
+        accountItems.removeAll()
         var shownAny = false, hiddenCount = 0
         for a in accounts {
             let u = results[a.name]
@@ -333,36 +412,21 @@ final class Controller: NSObject, NSMenuDelegate {
             if unavailable && !showUnavailable { hiddenCount += 1; continue }
             if hidden.contains(a.name) { hiddenCount += 1; continue }
             shownAny = true
-            var attrs = mono
-            let line: String
-            if a.source.isDisabled {
-                line = pad(a.name, 11) + "  — disabled"
-                attrs[.foregroundColor] = NSColor.tertiaryLabelColor
-            } else if let e = u?.error {
-                line = pad(a.name, 11) + "  ⚠ " + e
-                attrs[.foregroundColor] = NSColor.systemRed
-            } else if let u = u {
-                line = pad(a.name, 11) + "  "
-                     + meterBar(u.fiveH) + " " + pct(u.fiveH) + " " + pad(relTime(u.fiveHReset), 6)
-                     + "  " + meterBar(u.sevenD) + " " + pct(u.sevenD) + " " + pad(relTime(u.sevenDReset), 6)
-                     + (u.free ? "  free" : "")
-                if u.state == "rejected" || (u.sevenD ?? 0) >= 0.9 { attrs[.foregroundColor] = NSColor.systemRed }
-                else if u.state == "allowed_warning" || (u.sevenD ?? 0) >= 0.75 { attrs[.foregroundColor] = NSColor.systemOrange }
-            } else {
-                line = pad(a.name, 11) + "  checking…"
-            }
-            row(line, attrs)
+            let item = NSMenuItem()
+            item.isEnabled = false
+            applyRow(item, a)
+            menu.addItem(item)
+            accountItems[a.name] = item
         }
         if !shownAny { row("  no accounts to show", mono) }
         if hiddenCount > 0 { row("  (\(hiddenCount) hidden)", mono) }
 
         menu.addItem(.separator())
-        let last = results.values.compactMap { $0.checked }.max()
-        if refreshing { row("refreshing…", mono) }
-        else if let l = last {
-            let s = max(0, Int(-l.timeIntervalSinceNow))
-            row(s < 60 ? "updated just now" : "updated \(s / 60)m ago", mono)
-        } else { row("not yet updated", mono) }
+        let foot = NSMenuItem()
+        foot.isEnabled = false
+        applyFooter(foot)
+        menu.addItem(foot)
+        footerItem = foot
 
         add(menu, "Refresh now", #selector(doRefresh), key: "r")
 
@@ -430,7 +494,11 @@ final class Controller: NSObject, NSMenuDelegate {
 
     // MARK: actions
 
-    @objc func doRefresh() { refreshAll() }
+    @objc func doRefresh() {
+        reopenAfterRefresh = true
+        lastRefresh = nil           // force, ignoring the staleness guard
+        refreshAll()
+    }
     @objc func setInterval(_ s: NSMenuItem) { refreshMinutes = s.tag; rebuildMenu() }
     @objc func toggleUnavailable() { showUnavailable.toggle(); rebuildMenu() }
     @objc func toggleKeychain() {
