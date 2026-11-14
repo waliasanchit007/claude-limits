@@ -485,6 +485,12 @@ final class Controller: NSObject, NSMenuDelegate {
             accountItems[a.name] = item
         }
         if !shownAny { row("  no accounts to show", mono) }
+        if accounts.isEmpty {
+            let mi = NSMenuItem(title: "Add account\u{2026}", action: #selector(addAccount),
+                                keyEquivalent: "")
+            mi.target = self
+            menu.addItem(mi)
+        }
         if hiddenCount > 0 { row("  (\(hiddenCount) hidden)", mono) }
 
         menu.addItem(.separator())
@@ -518,6 +524,12 @@ final class Controller: NSObject, NSMenuDelegate {
             mi.state = hidden.contains(a.name) ? .off : .on
             pm.addItem(mi)
         }
+        if !accounts.isEmpty { pm.addItem(.separator()) }
+        let addAcct = NSMenuItem(title: "Add account\u{2026}", action: #selector(addAccount),
+                                 keyEquivalent: "")
+        addAcct.target = self
+        pm.addItem(addAcct)
+
         let pmItem = NSMenuItem(title: "Accounts", action: nil, keyEquivalent: "")
         settings.setSubmenu(pm, for: pmItem); settings.addItem(pmItem)
 
@@ -596,6 +608,137 @@ final class Controller: NSObject, NSMenuDelegate {
             a.informativeText = error.localizedDescription; a.runModal()
         }
         rebuildMenu()
+    }
+
+    // Accepts what a person actually pastes. Copying a token off the terminal
+    // picks up the line breaks the terminal added to wrap it, and a double tap
+    // of Cmd-V delivers it twice. Both produce a file that looks correct and
+    // then fails with an opaque 401, so both are repaired here rather than
+    // rejected.
+    struct Rejection: Error { let why: String }
+
+    func cleanedToken(_ raw: String) throws -> String {
+        var t = raw.filter { !$0.isWhitespace }
+        guard !t.isEmpty else { throw Rejection(why: "No token was entered.") }
+
+        let n = t.count
+        if n % 2 == 0, String(t.prefix(n / 2)) == String(t.suffix(n / 2)) {
+            t = String(t.prefix(n / 2))
+        }
+
+        let marker = "sk-ant-oat01-"
+        guard t.hasPrefix(marker) else {
+            throw Rejection(why: "That does not look like a setup-token. It should start "
+                            + "with \(marker), and come from `claude setup-token` rather "
+                            + "than an API key.")
+        }
+        guard t.components(separatedBy: marker).count - 1 <= 1 else {
+            throw Rejection(why: "Two different tokens were pasted together. Paste one.")
+        }
+        guard (100...130).contains(t.count) else {
+            throw Rejection(why: "The token is \(t.count) characters, but should be about 108. "
+                            + "It was probably truncated or only partly copied.")
+        }
+        return t
+    }
+
+    // The name becomes a filename, so anything that could escape TOKEN_DIR is
+    // refused rather than sanitised silently.
+    func cleanedName(_ raw: String) throws -> String {
+        let n = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !n.isEmpty else { throw Rejection(why: "Give the account a name.") }
+        let allowed = Set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
+        guard n.allSatisfy({ allowed.contains($0) }) else {
+            throw Rejection(why: "Use letters, digits, dashes or underscores only. "
+                            + "The name becomes a filename.")
+        }
+        guard n.lowercased() != "disabled" else {
+            throw Rejection(why: "\"disabled\" is reserved: it is the subdirectory for "
+                            + "accounts you want kept but not polled.")
+        }
+        return n
+    }
+
+    func complain(_ text: String) {
+        let a = NSAlert()
+        a.alertStyle = .warning
+        a.messageText = "Nothing was saved"
+        a.informativeText = text
+        a.runModal()
+    }
+
+    @objc func addAccount() {
+        // A menu bar app is not frontmost, so an un-activated alert can open
+        // behind whatever is.
+        NSApp.activate(ignoringOtherApps: true)
+
+        var name = "", token = ""
+        while true {
+            let alert = NSAlert()
+            alert.messageText = "Add a Claude account"
+            alert.informativeText =
+                "Sign in as the account you want and run  claude setup-token  in a "
+                + "terminal, then paste what it prints.\n\n"
+                + "The paste is checked before anything is written: wrapping picked up "
+                + "from the terminal is stripped, and a token pasted twice is collapsed."
+            alert.addButton(withTitle: "Add")
+            alert.addButton(withTitle: "Cancel")
+
+            let box = NSView(frame: NSRect(x: 0, y: 0, width: 330, height: 56))
+            let nameField = NSTextField(frame: NSRect(x: 0, y: 30, width: 330, height: 22))
+            nameField.placeholderString = "Name, for example work"
+            nameField.stringValue = name
+            let tokenField = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 330, height: 22))
+            tokenField.placeholderString = "Paste the token (sk-ant-oat01-\u{2026})"
+            box.addSubview(nameField)
+            box.addSubview(tokenField)
+            alert.accessoryView = box
+            alert.window.initialFirstResponder = nameField
+
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+            name = nameField.stringValue
+            token = tokenField.stringValue
+
+            do {
+                name = try cleanedName(name)
+                token = try cleanedToken(token)
+            } catch let r as Rejection {
+                complain(r.why); continue
+            } catch {
+                complain(error.localizedDescription); continue
+            }
+            break
+        }
+
+        let path = (TOKEN_DIR as NSString).appendingPathComponent("\(name).oauth")
+        if FileManager.default.fileExists(atPath: path) {
+            let c = NSAlert()
+            c.messageText = "Replace the existing token for \(name)?"
+            c.informativeText = path
+            c.addButton(withTitle: "Replace")
+            c.addButton(withTitle: "Cancel")
+            guard c.runModal() == .alertFirstButtonReturn else { return }
+            try? FileManager.default.removeItem(atPath: path)
+        }
+
+        // Created 0600 and 0700 outright. Writing first and fixing the mode
+        // afterwards leaves a window where the credential is world readable.
+        try? FileManager.default.createDirectory(
+            atPath: TOKEN_DIR, withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700])
+        let wrote = FileManager.default.createFile(
+            atPath: path, contents: Data((token + "\n").utf8),
+            attributes: [.posixPermissions: 0o600])
+        guard wrote else {
+            complain("Could not write \(path). Check that the directory is writable.")
+            return
+        }
+
+        reopenAfterRefresh = true
+        lastRefresh = nil
+        discover()
+        rebuildMenu()
+        refreshAll()
     }
 
     @objc func showInfo() {

@@ -36,7 +36,7 @@ Re-running it is safe; it asks before overwriting anything.
 To skip that question, `./install.sh --build-only`.
 
 If you already have accounts configured, the meter starts showing them straight
-away and there is nothing else to do.
+away and there is nothing else to do. If not, add one from the menu.
 
 Turn on **Settings → Launch at login** in the menu to keep it running.
 
@@ -66,12 +66,20 @@ source then says so rather than quietly spending.
 
 ## Adding accounts
 
+From the app, under **Settings → Accounts → Add account…**. When nothing is
+configured yet the same item sits on the main menu, so a fresh install is never a
+dead end. Give the account a name, paste what `claude setup-token` printed, and the
+app checks it and writes the file for you.
+
+From the terminal, if you installed the shell commands:
+
 ```sh
 claude-set-token work
 ```
 
-Use that rather than writing the file yourself. Pasting a token by hand fails in two
-ways, and both leave a file that looks correct and then returns an opaque 401:
+Both routes run the same checks, and the checks earn their place. Pasting a token by
+hand fails in two ways, and both leave a file that looks correct and then returns an
+opaque 401:
 
 - **The terminal wraps it.** `claude setup-token` prints the token to your terminal,
   so copying it from the screen can capture the line breaks and leading spaces the
@@ -79,11 +87,14 @@ ways, and both leave a file that looks correct and then returns an opaque 401:
 - **It arrives twice.** A double-tap of ⌘V gives you 216 characters where 108 belong,
   and the prefix still looks right.
 
-`claude-set-token` takes the paste hidden, strips whitespace, collapses a doubled
-paste, rejects a double paste of two *different* tokens, checks the prefix and
-length, and writes the file `0600`. It comes from
-`contrib/claude-multi-account.zsh`, which the installer offers to add to your
-`~/.zshrc`.
+So both routes take the paste hidden, strip the whitespace, collapse a doubled
+paste, reject two *different* tokens pasted together, check the prefix and length,
+and create the file `0600` rather than fixing the mode afterwards. The app also
+refuses a name that is not plain letters, digits, dashes or underscores, since the
+name becomes a filename.
+
+`claude-set-token` comes from `contrib/claude-multi-account.zsh`, which the
+installer offers to add to your `~/.zshrc`.
 
 ### Doing it by hand
 
