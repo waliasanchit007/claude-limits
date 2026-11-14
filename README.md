@@ -29,11 +29,14 @@ cd claude-limits
 ```
 
 It checks your macOS version and toolchain, builds the app into
-`~/Applications/ClaudeLimits.app`, launches it, then offers to add your first
-account and install the shell commands. Re-running it is safe; it asks before
-overwriting anything.
+`~/Applications/ClaudeLimits.app`, launches it, and lists the accounts it found.
+The one question it asks is whether to add the shell commands to your `~/.zshrc`.
+Re-running it is safe; it asks before overwriting anything.
 
-To build without the questions, `./install.sh --build-only` or `./build.sh`.
+To skip that question, `./install.sh --build-only`.
+
+If you already have accounts configured, the meter starts showing them straight
+away and there is nothing else to do.
 
 Turn on **Settings → Launch at login** in the menu to keep it running.
 
@@ -62,8 +65,6 @@ below, and Never spend tokens turns the paid route off. An account left with no 
 source then says so rather than quietly spending.
 
 ## Adding accounts
-
-The installer asks for your first one. To add more:
 
 ```sh
 claude-set-token work
