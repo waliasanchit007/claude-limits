@@ -49,7 +49,7 @@ let BUDGET_IS_DEFAULT = ProcessInfo.processInfo.environment["CLAUDE_LIMITS_5H_BU
 
 /// Model used for the fallback probe. Any model the account can reach works; the
 /// response is discarded and only the headers are read.
-let PROBE_MODEL = cfg("CLAUDE_LIMITS_MODEL", "probeModel", "claude-haiku-4-5-20251001")
+let PROBE_MODEL = cfg("CLAUDE_LIMITS_MODEL", "probeModel", "claude-haiku-4-5")
 /// Written by the local usage proxy, which harvests rate-limit headers from
 /// traffic your sessions were making anyway. Keyed by SHA-256 prefix of the
 /// token. Free and live, but only covers accounts actually in use.

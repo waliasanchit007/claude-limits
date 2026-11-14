@@ -2,3 +2,4 @@ ClaudeLimits
 *.bak
 *.o
 .DS_Store
+NOTES.local.md

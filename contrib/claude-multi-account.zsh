@@ -73,6 +73,62 @@ claude-reload-profiles() {
   done
 }
 
+# Show the org id and current usage for each account, as a table.
+#
+# This SPENDS TOKENS: one 9-token call per account (8 in, 1 out), the same probe
+# the meter uses. Nothing cheaper returns the rate-limit headers.
+#
+# The probe model must be one your subscription can call. Haiku 4.5 works on
+# subscription tokens; Sonnet and Haiku 5.5 answer them with a bare 429 carrying
+# no rate-limit headers at all. Override with CLAUDE_LIMITS_MODEL.
+claude-whoami() {
+  local profiles=("$@")
+  (( $# )) || profiles=($CLAUDE_MULTI_PROFILES)
+  (( ${#profiles} )) || { print -u2 "No accounts in $CLAUDE_MULTI_DIR"; return 1 }
+
+  local model="${CLAUDE_LIMITS_MODEL:-claude-haiku-4-5}"
+  local payload
+  payload=$(printf '{"model":"%s","max_tokens":1,"messages":[{"role":"user","content":"."}]}' "$model")
+
+  local p token hdrs org u5 u7 r5 r7 st
+  _cw_hv() { print -r -- "$hdrs" | grep -i "^$1:" | sed "s/^[^:]*: *//" }
+  _cw_ts() { [[ -n "$1" ]] && date -r "$1" "+%m-%d %H:%M" 2>/dev/null || print -n "?" }
+
+  printf "%-10s %-38s %5s %5s %-12s %-12s %s\n" \
+    PROFILE ORGANIZATION-ID 5H 7D 5H-RESET 7D-RESET STATUS
+  for p in "${profiles[@]}"; do
+    token="$(_claude_multi_token "$p" 2>/dev/null)" || {
+      printf "%-10s %s\n" "$p" "(no token)"; continue
+    }
+    hdrs=$(curl -s -m 30 -D - -o /dev/null https://api.anthropic.com/v1/messages \
+      -H "Authorization: Bearer $token" \
+      -H "anthropic-version: 2023-06-01" \
+      -H "anthropic-beta: oauth-2025-04-20" \
+      -H "content-type: application/json" \
+      -d "$payload" | tr -d '\r')
+
+    if ! print -r -- "$hdrs" | grep -qE '^HTTP/[0-9.]+ 200'; then
+      printf "%-10s %s\n" "$p" "(failed: $(print -r -- "$hdrs" | head -1))"
+      continue
+    fi
+
+    org=$(_cw_hv anthropic-organization-id)
+    u5=$(_cw_hv anthropic-ratelimit-unified-5h-utilization)
+    u7=$(_cw_hv anthropic-ratelimit-unified-7d-utilization)
+    r5=$(_cw_ts "$(_cw_hv anthropic-ratelimit-unified-5h-reset)")
+    r7=$(_cw_ts "$(_cw_hv anthropic-ratelimit-unified-7d-reset)")
+    st=$(_cw_hv anthropic-ratelimit-unified-status)
+    printf "%-10s %-38s %5s %5s %-12s %-12s %s\n" \
+      "$p" "${org:-?}" "${u5:-?}" "${u7:-?}" "$r5" "$r7" "${st:-?}"
+  done
+  unset -f _cw_hv _cw_ts 2>/dev/null
+
+  print -r -- ""
+  print -r -- "Accounts in one org share an org id but keep separate reset windows, so the"
+  print -r -- "reset columns are what tell them apart. Email addresses are not recoverable"
+  print -r -- "from these tokens; run /status inside a session to see one."
+}
+
 claude-profiles() {
   local p
   (( ${#CLAUDE_MULTI_PROFILES} )) || { print -r -- "  none found in $CLAUDE_MULTI_DIR"; return }
